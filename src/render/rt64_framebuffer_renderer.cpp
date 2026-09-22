@@ -16,7 +16,28 @@
 #include "rt64_descriptor_sets.h"
 #include "rt64_render_worker.h"
 
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+
 // TODO: Move to shared.
+
+namespace {
+    // Traza temporal de depuracion (HH_RECT_TRACE=1) que funciona tambien en Release
+    // (RT64_LOG_PRINTF se compila a nada con NDEBUG). Escribe en hh-rect.log junto al exe.
+    void hhRectLog(const char *fmt, ...) {
+        static const bool enabled = (std::getenv("HH_RECT_TRACE") != nullptr);
+        if (!enabled) return;
+        static FILE *f = std::fopen("hh-rect.log", "a");
+        if (f == nullptr) return;
+        va_list ap;
+        va_start(ap, fmt);
+        std::vfprintf(f, fmt, ap);
+        va_end(ap);
+        std::fputc('\n', f);
+        std::fflush(f);
+    }
+}
 
 namespace interop {
     struct BicubicCB {
@@ -65,7 +86,11 @@ namespace RT64 {
 
             auto correctMisalignment = [=](int32_t coord, uint16_t origin) {
                 if (origin < G_EX_ORIGIN_NONE) {
-                    return int32_t(coord - (coord % std::lround(resScale[1]))) - horizontalMisalignment;
+                    // HH patch: rt64#82: con origen a la derecha, redondear hacia ARRIBA (no hacia abajo).
+                    const int32_t align = std::lround(resScale[1]);
+                    const int32_t rem = coord % align;
+                    const int32_t aligned = (origin == G_EX_ORIGIN_RIGHT) ? (coord + ((align - rem) % align)) : (coord - rem);
+                    return aligned - horizontalMisalignment;
                 }
                 else {
                     return coord;
@@ -97,7 +122,10 @@ namespace RT64 {
         
         auto correctMisalignment = [=](float coord, uint16_t origin) {
             if (origin < G_EX_ORIGIN_NONE) {
-                return (coord - std::fmod(coord, resScale[1])) - horizontalMisalignment;
+                // HH patch: rt64#82: con origen a la derecha, redondear hacia ARRIBA (no hacia abajo).
+                const float rem = std::fmod(coord, resScale[1]);
+                const float aligned = (origin == G_EX_ORIGIN_RIGHT) ? (coord + std::fmod(resScale[1] - rem, resScale[1])) : (coord - rem);
+                return aligned - horizontalMisalignment;
             }
             else {
                 return coord;
@@ -1501,6 +1529,14 @@ namespace RT64 {
                         const float centerOffset = ((middleViewport * viewportOrigin) / G_EX_ORIGIN_CENTER) * extOriginPercentage + middleViewport * (1.0f - extOriginPercentage);
                         triangles.screenOffset.x = halfPixelOffset.x + ((centerOffset - middleViewport) / halfViewportSize.x);
                     }
+
+                    // HH patch: 2D ortho misalignment: los rects (fill/texrect) reciben la correccion
+                    // horizontalMisalignment; los triangulos ortograficos 2D no. Sin esto, el
+                    // contenido de un panel (triangulos) queda desfasado respecto a su fondo (rect).
+                    // 2.0/wideWidth: el viewport cubre 2 unidades NDC, asi que 1 px = 2/wideWidth.
+                    if (proj.type == Projection::Type::Orthographic) {
+                        triangles.screenOffset.x -= p.horizontalMisalignment * 2.0f / wideWidth;
+                    }
                 }
 
                 viewportClip = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
@@ -1548,6 +1584,14 @@ namespace RT64 {
                     }
 
                     clearRect.rect = convertFixedRect(call.callDesc.rect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, horizontalMisalignment, call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin);
+                    if (std::getenv("HH_RECT_TRACE") != nullptr) {
+                        hhRectLog("[hh-rect] FILL callRect=%d,%d..%d,%d pairScissor=%d,%d..%d,%d invRatio=%.4f misalign=%d origins=%d/%d adjust=%d resScale=%.3f,%.3f extOrigin=%.3f fbWidth=%d",
+                                call.callDesc.rect.ulx, call.callDesc.rect.uly, call.callDesc.rect.lrx, call.callDesc.rect.lry,
+                                fbPair.scissorRect.ulx, fbPair.scissorRect.uly, fbPair.scissorRect.lrx, fbPair.scissorRect.lry,
+                                invRatioScale, horizontalMisalignment, call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin,
+                                (adjustRatio ? 1 : 0), p.resolutionScale.x, p.resolutionScale.y, extOriginPercentage, p.fbWidth);
+                        hhRectLog("[hh-rect] FILL out=%d,%d..%d,%d (render px)", clearRect.rect.left, clearRect.rect.top, clearRect.rect.right, clearRect.rect.bottom);
+                    }
                 }
                 else if (call.callDesc.extendedType != DrawExtendedType::None) {
                     switch (call.callDesc.extendedType) {
@@ -1631,6 +1675,14 @@ namespace RT64 {
                             instanceDrawCall.type = InstanceDrawCall::Type::IndexedTriangles;
                             triangles.indexStart = triangles.vertexTestZ ? vertexTestZFaceIndicesStart : call.meshDesc.faceIndicesStart;
                             invRatioScale = projInvRatioScale;
+                            // HH: el scissor Ortopédico debe recibir el mismo horizontalMisalignment
+                            // que los rects (p.ej. fondo del mapa). La geometría ya se desplaza con
+                            // screenOffset (ver patch más abajo); sin esto el clip queda ~4 px a la
+                            // derecha del fondo y el contenido asoma por el borde derecho del panel.
+                            // convertFixedRect solo aplica misalign si el origen no es NONE.
+                            if (proj.type == Projection::Type::Orthographic) {
+                                horizontalMisalignment = p.horizontalMisalignment;
+                            }
                             break;
                         }
                         case Projection::Type::Rectangle: {
@@ -1653,6 +1705,18 @@ namespace RT64 {
                             }
 
                             RenderViewport viewportRect = convertViewportRect(call.callDesc.rect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, horizontalMisalignment, call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin);
+                            if (std::getenv("HH_RECT_TRACE") != nullptr) {
+                                hhRectLog("[hh-rect] RECT rect=%d,%d..%d,%d pairScissor=%d,%d..%d,%d rectOri=%d/%d cycle=%d ext=%d invRatio=%.4f misalign=%.2f asp=%d adjust=%d resScale=%.3f,%.3f extOrigin=%.3f fbWidth=%d regularOrigins=%d covers=%d",
+                                        call.callDesc.rect.ulx, call.callDesc.rect.uly, call.callDesc.rect.lrx, call.callDesc.rect.lry,
+                                        fbPair.scissorRect.ulx, fbPair.scissorRect.uly, fbPair.scissorRect.lrx, fbPair.scissorRect.lry,
+                                        call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin,
+                                        int(call.shaderDesc.otherMode.cycleType()), int(call.callDesc.extendedType),
+                                        invRatioScale, horizontalMisalignment, int(call.callDesc.rectAspect),
+                                        (adjustRatio ? 1 : 0), p.resolutionScale.x, p.resolutionScale.y, extOriginPercentage, p.fbWidth,
+                                        int(regularOrigins), int(coversScissorWidth));
+                                hhRectLog("[hh-rect] RECT vpOut=%.1f,%.1f..%.1f,%.1f (render px)",
+                                        viewportRect.x, viewportRect.y, viewportRect.x + viewportRect.width, viewportRect.y + viewportRect.height);
+                            }
                             triangles.screenScale = { viewportRect.width / framebuffer.viewport.width, viewportRect.height / framebuffer.viewport.height };
                             triangles.screenOffset.x = halfPixelOffset.x + ((viewportRect.x + viewportRect.width / 2.0f) - halfViewportSize.x) / halfViewportSize.x;
                             triangles.screenOffset.y = halfPixelOffset.y + (halfViewportSize.y - (viewportRect.y + viewportRect.height / 2.0f)) / halfViewportSize.y;
@@ -1681,6 +1745,18 @@ namespace RT64 {
                         bool usesViewport = (proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic);
                         if (usesViewport) {
                             triangles.scissor = viewportScissorIntersection(viewportClip, triangles.scissor);
+                        }
+
+                        if (std::getenv("HH_RECT_TRACE") != nullptr) {
+                            hhRectLog("[hh-rect] TRI type=%d callScissor=%d,%d..%d,%d pairScissor=%d,%d..%d,%d invRatio=%.4f misalign=%.2f origins=%d/%d adjust=%d resScale=%.3f,%.3f extOrigin=%.3f fbWidth=%d",
+                                    int(proj.type),
+                                    call.callDesc.scissorRect.ulx, call.callDesc.scissorRect.uly, call.callDesc.scissorRect.lrx, call.callDesc.scissorRect.lry,
+                                    fbPair.scissorRect.ulx, fbPair.scissorRect.uly, fbPair.scissorRect.lrx, fbPair.scissorRect.lry,
+                                    invRatioScale, horizontalMisalignment, call.callDesc.scissorLeftOrigin, call.callDesc.scissorRightOrigin,
+                                    (adjustRatio ? 1 : 0), p.resolutionScale.x, p.resolutionScale.y, extOriginPercentage, p.fbWidth);
+                            hhRectLog("[hh-rect] TRI outScissor=%d,%d..%d,%d vpClip=%.1f,%.1f..%.1f,%.1f (render px)",
+                                    triangles.scissor.left, triangles.scissor.top, triangles.scissor.right, triangles.scissor.bottom,
+                                    viewportClip.x, viewportClip.y, viewportClip.x + viewportClip.width, viewportClip.y + viewportClip.height);
                         }
                         
                         if (triangles.vertexTestZ && usesViewport) {
