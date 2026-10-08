@@ -9,6 +9,8 @@
 
 #include "xxHash/xxh3.h"
 
+#include <cstdlib>
+
 namespace RT64 {
     // GameFrame
     
@@ -234,6 +236,21 @@ namespace RT64 {
         }
 
         matchResult.positionDifference = hlslpp::length(curPos - prevPos);
+
+        // HH: gate de discontinuidad de POSICION. Un objeto con id estable (p. ej. un efecto C768) que
+        // se reubica/teletransporta en 1 frame no es el mismo objeto: si el salto de traslacion supera
+        // `HH_PAIR_MAX` unidades, se rechaza el par -> RT64 no lo interpola (snap) y no se ve el
+        // barrido/teletransporte. `HH_PAIR_MAX=0` lo apaga. (Metodo estandar: limite de pareja;
+        // docs/interpolacion-pairing.md §6.)
+        static const float hh_pair_max = []() {
+            const char *e = std::getenv("HH_PAIR_MAX");
+            if (e == nullptr || *e == '\0') return 150.0f;
+            const float v = static_cast<float>(std::atof(e));
+            return (v > 0.0f) ? v : -1.0f;
+        }();
+        if ((hh_pair_max > 0.0f) && (matchResult.positionDifference > hh_pair_max)) {
+            return matchResult;   // invalid -> sin pareja (no interpola)
+        }
 
         // Compute the dot product difference between the normalized XYZ vectors of the 3x3 matrices.
         matchResult.orientationDifference =
